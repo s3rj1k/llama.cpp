@@ -1,0 +1,96 @@
+name: macos-standalone
+
+# Manual-only: builds llama-server on macOS arm64 with BoringSSL +
+# LLAMA_FATAL_WARNINGS=ON to verify the SSL code path compiles without
+# warnings. Mirrors the SSL-relevant subset of the macOS-latest-arm64
+# job in build.yml without pulling in Metal/RPC/test artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - self-signed-cert
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DGGML_METAL=OFF
+
+      - name: Build llama-server
+        run: |
+          time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) --target llama-server
+
+      - name: Verify SSL linkage
+        run: |
+          otool -L build/bin/llama-server | grep -E "ssl|crypto" || true
+          build/bin/llama-server --help 2>&1 | grep -iE "ssl-(key|cert|san|valid)" | head -10
+
+      - name: Upload llama-server (Actions artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-server-macos-arm64-boringssl
+          path: build/bin/llama-server
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Stage Pages content
+        run: |
+          mkdir -p pages-out
+          cp build/bin/llama-server pages-out/llama-server
+          shasum -a 256 pages-out/llama-server > pages-out/llama-server.sha256
+          cat > pages-out/index.html <<EOF
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>llama-server (macOS arm64, BoringSSL)</title>
+          <h1>llama-server &mdash; macOS arm64, BoringSSL</h1>
+          <p>Built from commit
+          <a href="https://github.com/${{ github.repository }}/commit/${{ github.sha }}">${{ github.sha }}</a>
+          on ref <code>${{ github.ref_name }}</code>.</p>
+          <ul>
+            <li><a href="llama-server">llama-server</a> (binary)</li>
+            <li><a href="llama-server.sha256">llama-server.sha256</a></li>
+          </ul>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: pages-out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
