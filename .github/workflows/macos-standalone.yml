@@ -1,0 +1,200 @@
+name: macos-standalone
+
+# Builds a self-contained, statically-linked unified `llama` binary for
+# macOS arm64 with BoringSSL + Metal GPU support, and publishes it to
+# GitHub Pages. The binary dispatches every subcommand (serve, cli,
+# bench, ...) from a single executable, embeds the Metal shader library
+# so no default.metallib sidecar is required, and uses cpp-httplib +
+# BoringSSL for HuggingFace model downloads (no libcurl runtime dep).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - self-signed-cert
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_APP=ON \
+            -DLLAMA_LLGUIDANCE=ON \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
+            -DGGML_LTO=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ARM_ARCH=armv8.7-a+dotprod+fp16+i8mm+bf16 \
+            -DCMAKE_C_FLAGS=-mcpu=apple-m3 \
+            -DCMAKE_CXX_FLAGS=-mcpu=apple-m3 \
+            -DCMAKE_ASM_FLAGS=-mcpu=apple-m3 \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_CPU_KLEIDIAI=ON
+
+      - name: Build llama
+        run: |
+          time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) --target llama-app
+
+      - name: Verify self-contained binary
+        run: |
+          # Confirm no @rpath/@loader_path dylib dependencies leaked in — only
+          # Apple system libraries (/usr/lib/*, /System/Library/*) are allowed.
+          deps=$(otool -L build/bin/llama | tail -n +2 | awk '{print $1}')
+          echo "$deps"
+          bad=$(printf '%s\n' "$deps" | grep -vE '^(/usr/lib/|/System/Library/)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::llama has non-system dylib dependencies:"
+            echo "$bad"
+            exit 1
+          fi
+          # Run from an unrelated directory to prove the binary is relocatable.
+          mkdir -p /tmp/relocation-check
+          cp build/bin/llama /tmp/relocation-check/
+          /tmp/relocation-check/llama help all >/dev/null
+
+      - name: Verify SSL linkage
+        run: |
+          otool -L build/bin/llama | grep -E "ssl|crypto" || true
+          build/bin/llama serve --help 2>&1 | grep -iE "ssl-(key|cert|san|valid)" | head -10
+
+      - name: Upload llama (Actions artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-macos-arm64-boringssl
+          path: build/bin/llama
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Stage Pages content
+        run: |
+          mkdir -p pages-out
+          cp build/bin/llama pages-out/llama
+          shasum -a 256 pages-out/llama > pages-out/llama.sha256
+          cat > pages-out/index.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>llama &mdash; macOS arm64 (M3+), BoringSSL, Metal</title>
+          <style>
+            :root { color-scheme: light dark; }
+            body {
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+              max-width: 720px;
+              margin: 2em auto;
+              padding: 0 1em 3em;
+              line-height: 1.55;
+            }
+            h1 { font-size: 1.5em; margin: 0 0 0.4em; }
+            h2 { font-size: 1.1em; margin: 1.6em 0 0.5em; }
+            p { margin: 0.6em 0; }
+            code, pre {
+              font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+              font-size: 0.9em;
+            }
+            code {
+              background: rgba(127,127,127,0.15);
+              padding: 0.1em 0.35em;
+              border-radius: 3px;
+            }
+            pre {
+              background: rgba(127,127,127,0.1);
+              border: 1px solid rgba(127,127,127,0.25);
+              padding: 0.8em 1em;
+              border-radius: 6px;
+              overflow-x: auto;
+              line-height: 1.4;
+            }
+            pre code { background: none; padding: 0; font-size: inherit; }
+            a { color: #0a66c2; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            @media (prefers-color-scheme: dark) {
+              a { color: #6cb6ff; }
+            }
+            ul { padding-left: 1.2em; }
+            .meta { color: #888; font-size: 0.9em; }
+          </style>
+          </head>
+          <body>
+          <h1>llama &mdash; macOS arm64 (M3+), BoringSSL, Metal</h1>
+
+          <p class="meta">Built from commit
+          <a href="https://github.com/${{ github.repository }}/commit/${{ github.sha }}"><code>${{ github.sha }}</code></a>
+          on ref <code>${{ github.ref_name }}</code>.</p>
+
+          <p>Unified self-contained static binary &mdash; no dylibs and no
+          <code>default.metallib</code> sidecar required. Metal GPU,
+          KleidiAI CPU kernels, and HuggingFace model downloads (via
+          BoringSSL) are enabled. CPU codegen targets
+          <code>armv8.7-a+dotprod+fp16+i8mm+bf16</code> with
+          <code>-mcpu=apple-m3</code> pipeline tuning &mdash; requires
+          Apple&nbsp;M3 or later (M1/M2 users should build from source).</p>
+
+          <h2>Download</h2>
+          <ul>
+            <li><a href="llama">llama</a> &middot; <a href="llama.sha256">llama.sha256</a></li>
+          </ul>
+
+          <h2>First run</h2>
+          <pre><code>chmod +x llama
+          xattr -d com.apple.quarantine llama
+          </code></pre>
+
+          <h2>Subcommands</h2>
+          <pre><code>./llama serve  --help    # HTTP API server
+          ./llama cli    --help    # interactive chat
+          ./llama help   all       # full command list
+          </code></pre>
+
+          </body>
+          </html>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: pages-out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
